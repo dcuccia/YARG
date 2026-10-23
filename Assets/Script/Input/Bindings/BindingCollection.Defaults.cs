@@ -1,6 +1,7 @@
 using System;
 using PlasticBand.Devices;
 using UnityEngine.InputSystem;
+using YARG.Input.Devices;
 
 namespace YARG.Input
 {
@@ -23,6 +24,8 @@ namespace YARG.Input
 
                 ProGuitar guitar => SetDefaultBindings(guitar),
                 ProKeyboard keyboard => SetDefaultBindings(keyboard),
+
+                HgpBellDevice bell => SetDefaultBindings(bell),
 
                 // Turntable turntable => SetDefaultBindings(turntable),
 

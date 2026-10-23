@@ -14,6 +14,8 @@ using YARG.Core.Logging;
 using YARG.Helpers;
 using YARG.Input;
 using YARG.Input.Bindings;
+using YARG.Input.Devices;
+using YARG.Integration.Hgp;
 using YARG.Localization;
 using YARG.Menu.MusicLibrary;
 using YARG.Menu.Filters;
@@ -964,8 +966,16 @@ namespace YARG.Player
 
             GameMode gameMode = default;
             string profileName = string.Empty;
+            Instrument? hgpInstrument = null;
 
-            if (device is FiveFretGuitar)
+            if (device is HgpBellDevice bell)
+            {
+                // Handbell ringer: Five-Lane Keys on the ringer's part track (see HgpRingerSlots)
+                gameMode = GameMode.ProKeys;
+                profileName = $"Ringer {bell.RingerSlot + 1}";
+                hgpInstrument = HgpRingerSlots.InstrumentForSlot(bell.RingerSlot);
+            }
+            else if (device is FiveFretGuitar)
             {
                 gameMode = GameMode.FiveFretGuitar;
                 profileName = "New Guitar Profile";
@@ -1007,6 +1017,12 @@ namespace YARG.Player
                 HighwayLength = 1,
                 GameMode = gameMode
             };
+
+            if (hgpInstrument is { } instrument)
+            {
+                newProfile.CurrentInstrument = instrument;
+                newProfile.CurrentDifficulty = Difficulty.Expert;
+            }
 
             AddProfile(newProfile);
 

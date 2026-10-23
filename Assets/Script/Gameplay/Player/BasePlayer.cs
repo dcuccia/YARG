@@ -12,6 +12,7 @@ using YARG.Gameplay.HUD;
 using YARG.Helpers.Extensions;
 using YARG.Helpers.UI;
 using YARG.Input;
+using YARG.Integration.Hgp;
 using YARG.Player;
 using YARG.Settings;
 
@@ -112,6 +113,9 @@ namespace YARG.Gameplay.Player
 
         private List<GameInput> _replayInputs;
 
+        // Non-null when a bound device delivers late, source-timestamped inputs (e.g. HGP bells)
+        private LookbehindInputQueue _lookbehind;
+
         private int _replayInputIndex;
 
         private float _noteSpeedDifficultyScale;
@@ -153,6 +157,27 @@ namespace YARG.Gameplay.Player
             if (!Player.IsReplay)
             {
                 SubscribeToInputEvents();
+                SetUpLookbehind();
+            }
+        }
+
+        private void SetUpLookbehind()
+        {
+            if (Player.Bindings is null)
+            {
+                return;
+            }
+
+            double budget = 0;
+            foreach (var device in Player.Bindings.GetDevicesByType<IInputLatencyBudget>())
+            {
+                budget = System.Math.Max(budget, device.LatencyBudgetSeconds);
+            }
+
+            _lookbehind = budget > 0 ? new LookbehindInputQueue(budget) : null;
+            if (_lookbehind != null)
+            {
+                YargLogger.LogFormatInfo("Player {0}: input lookbehind {1} ms", Player.Profile.Name, budget * 1000);
             }
         }
 
@@ -220,6 +245,8 @@ namespace YARG.Gameplay.Player
 
         public virtual void ResetPracticeSection()
         {
+            _lookbehind?.Clear();
+
             LastCombo = 0;
 
             IsFc = true;
@@ -274,6 +301,13 @@ namespace YARG.Gameplay.Player
             // Apply input offset
             // Video offset is already accounted for
             time += InputCalibration;
+
+            if (_lookbehind != null)
+            {
+                // Run the engine behind the input clock so late network inputs keep their source times
+                time -= _lookbehind.BudgetSeconds;
+                _lookbehind.DrainUpTo(time, QueueToEngine);
+            }
 
             if (Player.IsReplay && GameManager.ReplayInfo != null)
             {
@@ -398,6 +432,17 @@ namespace YARG.Gameplay.Player
             // Allow the input to be explicitly ignored before processing it
             if (InterceptInput(ref input)) return;
 
+            if (_lookbehind != null)
+            {
+                _lookbehind.Enqueue(input);
+                return;
+            }
+
+            QueueToEngine(ref input);
+        }
+
+        private void QueueToEngine(ref GameInput input)
+        {
             BaseEngine.QueueInput(ref input);
             OnInputQueued(input);
             _replayInputs.Add(input);
