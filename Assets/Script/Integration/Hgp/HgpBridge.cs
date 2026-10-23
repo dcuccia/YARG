@@ -12,7 +12,9 @@ using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.Controls;
 using UnityEngine.InputSystem.Layouts;
 using UnityEngine.InputSystem.LowLevel;
+using UnityEngine.SceneManagement;
 using YARG.Core.Logging;
+using YARG.Gameplay;
 using YARG.Input.Devices;
 
 namespace YARG.Integration.Hgp
@@ -76,6 +78,14 @@ namespace YARG.Integration.Hgp
         private UdpClient _udp;
         private Thread _thread;
         private volatile bool _running;
+        private volatile IPEndPoint _sidecar;
+        private GameManager _gameManager;
+
+        // Per-device ring log: "is input arriving, and how late?" (age = arrival - mapped source time)
+        private readonly Dictionary<string, int> _ringsByDevice = new();
+        private int _ringsSinceReport;
+        private double _ageSum, _ageMax;
+        private double _nextReport;
         private System.Random _rng = new(1);
 
         private bool _keyboardFeeder;
@@ -133,10 +143,70 @@ namespace YARG.Integration.Hgp
                 YargLogger.LogFormatInfo("HGP keyboard feeder on: delay {0} ms, jitter {1} ms",
                     _kbdDelay * 1000, _kbdJitter * 1000);
             }
+
+            SceneManager.sceneLoaded += OnSceneLoaded;
+        }
+
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            var gameManager = FindAnyObjectByType<GameManager>();
+            if (gameManager == null || gameManager == _gameManager)
+            {
+                return;
+            }
+
+            _gameManager = gameManager;
+            gameManager.ChartLoaded += _ => ReportSong(gameManager);
+        }
+
+        /// <summary>
+        /// Tells the sidecar which song is starting and which part/difficulty each bell device plays,
+        /// so it can hand each phone the bells of that ringer's chart part.
+        /// </summary>
+        private void ReportSong(GameManager gameManager)
+        {
+            var players = new List<(string, int, string)>();
+            foreach (var player in gameManager.YargPlayers)
+            {
+                if (player.Bindings is null)
+                {
+                    continue;
+                }
+
+                foreach (var bell in player.Bindings.GetDevicesByType<HgpBellDevice>())
+                {
+                    int part = Array.IndexOf(HgpRingerSlots.Instruments, player.Profile.CurrentInstrument);
+                    players.Add((bell.description.serial, part, player.Profile.CurrentDifficulty.ToString()));
+                }
+            }
+
+            string text = HgpPacket.FormatSong(gameManager.Song?.Name, players);
+            YargLogger.LogInfo($"HGP: song report: {text}");
+            SendToSidecar(text);
+        }
+
+        private void SendToSidecar(string text)
+        {
+            var sidecar = _sidecar;
+            if (sidecar == null || _udp == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var bytes = Encoding.UTF8.GetBytes(text);
+                _udp.Send(bytes, bytes.Length, sidecar);
+            }
+            catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+            {
+                // Sidecar gone; it re-registers with its next datagram
+            }
         }
 
         private void OnDestroy()
         {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
             _running = false;
             _udp?.Close();
             if (_keyboardFeeder)
@@ -164,6 +234,11 @@ namespace YARG.Integration.Hgp
                 {
                     var bytes = _udp.Receive(ref remote);
                     long ticks = Stopwatch.GetTimestamp();
+                    if (!remote.Equals(_sidecar))
+                    {
+                        _sidecar = new IPEndPoint(remote.Address, remote.Port);
+                    }
+
                     _received.Enqueue(new Received { Text = Encoding.UTF8.GetString(bytes), Ticks = ticks });
                 }
                 catch (SocketException)
@@ -200,6 +275,21 @@ namespace YARG.Integration.Hgp
                 _delayed.RemoveAt(i);
                 QueueRing(ring.Device, ring.Bell, ring.Down, ring.Time, now);
             }
+
+            if (_ringsSinceReport > 0 && now >= _nextReport)
+            {
+                var counts = new StringBuilder();
+                foreach (var pair in _ringsByDevice)
+                {
+                    counts.Append(counts.Length > 0 ? ", " : "").Append(pair.Key).Append('=').Append(pair.Value);
+                }
+
+                YargLogger.LogInfo($"HGP: rings by device [{counts}]; last {_ringsSinceReport}: " +
+                    $"arrival age mean {_ageSum / _ringsSinceReport * 1000:0.0} ms, max {_ageMax * 1000:0.0} ms");
+                _ringsSinceReport = 0;
+                _ageSum = _ageMax = 0;
+                _nextReport = now + 5;
+            }
         }
 
         private void Handle(in HgpPacket packet, double localReceive, double now)
@@ -208,6 +298,7 @@ namespace YARG.Integration.Hgp
             {
                 case HgpPacketKind.Sync:
                     _clock.AddSample(packet.Time, localReceive);
+                    SendToSidecar(HgpPacket.Pong(packet.Time).ToString());
                     break;
                 case HgpPacketKind.Hello:
                     if (!_devices.ContainsKey(packet.Device))
@@ -240,7 +331,24 @@ namespace YARG.Integration.Hgp
                         device = AddBellDevice(packet.Device, _devices.Count, null);
                     }
 
-                    QueueRing(device, packet.Bell, packet.Down, _clock.ToLocal(packet.Time), now);
+                    double time = _clock.ToLocal(packet.Time);
+                    if (packet.Down)
+                    {
+                        int count = _ringsByDevice.TryGetValue(packet.Device, out int c) ? c + 1 : 1;
+                        _ringsByDevice[packet.Device] = count;
+                        if (count == 1)
+                        {
+                            YargLogger.LogInfo($"HGP: first ring from {packet.Device} (bell {packet.Bell}, " +
+                                $"arrival age {(localReceive - time) * 1000:0.0} ms)");
+                        }
+
+                        double age = localReceive - time;
+                        _ringsSinceReport++;
+                        _ageSum += age;
+                        _ageMax = Math.Max(_ageMax, age);
+                    }
+
+                    QueueRing(device, packet.Bell, packet.Down, time, now);
                     break;
             }
         }
@@ -294,7 +402,7 @@ namespace YARG.Integration.Hgp
             device.RingerSlot = slot;
             device.LatencyBudgetSeconds = DefaultLatencyBudgetSeconds;
             _devices[id] = device;
-            YargLogger.LogFormatInfo("HGP: bell device {0} joined as ringer slot {1}", id, slot);
+            YargLogger.LogInfo($"HGP: bell device {id} ({device.description.product}) joined as ringer slot {slot}");
             return device;
         }
 
